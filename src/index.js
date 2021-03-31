@@ -11,6 +11,8 @@ import serialize from "serialize-javascript";
 
 import schema from "./options.json";
 
+const defaultFilename = "[path][base].gz";
+
 class CompressionPlugin {
   constructor(options = {}) {
     validate(schema, options, {
@@ -23,8 +25,9 @@ class CompressionPlugin {
       include,
       exclude,
       algorithm = "gzip",
-      compressionOptions = {},
-      filename = "[path][base].gz",
+      algorithms = [],
+      compressionOptions,
+      filename = defaultFilename,
       threshold = 0,
       minRatio = 0.8,
       deleteOriginalAssets = false,
@@ -34,59 +37,75 @@ class CompressionPlugin {
       test,
       include,
       exclude,
-      algorithm,
-      compressionOptions,
-      filename,
+      algorithms,
       threshold,
       minRatio,
       deleteOriginalAssets,
     };
 
-    this.algorithm = this.options.algorithm;
-
-    if (typeof this.algorithm === "string") {
-      // eslint-disable-next-line global-require
-      const zlib = require("zlib");
-
-      this.algorithm = zlib[this.algorithm];
-
-      if (!this.algorithm) {
-        throw new Error(
-          `Algorithm "${this.options.algorithm}" is not found in "zlib"`
-        );
-      }
-
-      const defaultCompressionOptions =
-        {
-          gzip: {
-            level: zlib.constants.Z_BEST_COMPRESSION,
-          },
-          deflate: {
-            level: zlib.constants.Z_BEST_COMPRESSION,
-          },
-          deflateRaw: {
-            level: zlib.constants.Z_BEST_COMPRESSION,
-          },
-          brotliCompress: {
-            params: {
-              [zlib.constants.BROTLI_PARAM_QUALITY]:
-                zlib.constants.BROTLI_MAX_QUALITY,
-            },
-          },
-        }[algorithm] || {};
-
-      this.options.compressionOptions = {
-        ...defaultCompressionOptions,
-        ...this.options.compressionOptions,
-      };
+    if (algorithms.length === 0) {
+      algorithms.push({
+        algorithm,
+        filename,
+        compressionOptions,
+      });
     }
+
+    this.algorithmFns = {};
+
+    algorithms.forEach(
+      (
+        { algorithm, filename = defaultFilename, compressionOptions = {} },
+        index
+      ) => {
+        this.options.algorithms[index].compressionOptions = compressionOptions;
+        this.options.algorithms[index].filename = filename;
+        this.algorithmFns[algorithm] = algorithm;
+
+        if (typeof algorithm === "string") {
+          // eslint-disable-next-line global-require
+          const zlib = require("zlib");
+
+          this.algorithmFns[algorithm] = zlib[algorithm];
+
+          if (!this.algorithmFns[algorithm]) {
+            throw new Error(`Algorithm "${algorithm}" is not found in "zlib"`);
+          }
+
+          const defaultCompressionOptions =
+            {
+              gzip: {
+                level: zlib.constants.Z_BEST_COMPRESSION,
+              },
+              deflate: {
+                level: zlib.constants.Z_BEST_COMPRESSION,
+              },
+              deflateRaw: {
+                level: zlib.constants.Z_BEST_COMPRESSION,
+              },
+              brotliCompress: {
+                params: {
+                  [zlib.constants.BROTLI_PARAM_QUALITY]:
+                    zlib.constants.BROTLI_MAX_QUALITY,
+                },
+              },
+            }[algorithm] || {};
+
+          this.options.algorithms[index].compressionOptions = {
+            ...defaultCompressionOptions,
+            ...compressionOptions,
+          };
+          this.options.algorithms[index].filename = filename;
+        }
+      }
+    );
   }
 
-  runCompressionAlgorithm(input) {
+  runCompressionAlgorithm(algorithm, compressionOptions, input) {
     return new Promise((resolve, reject) => {
-      this.algorithm(
+      this.algorithmFns[algorithm](
         input,
-        this.options.compressionOptions,
+        compressionOptions,
         (error, result) => {
           if (error) {
             return reject(error);
@@ -105,199 +124,228 @@ class CompressionPlugin {
 
   async compress(compiler, compilation, assets) {
     const cache = compilation.getCache("CompressionWebpackPlugin");
-    const assetsForMinify = (
-      await Promise.all(
-        Object.keys(assets).map(async (name) => {
-          const { info, source } = compilation.getAsset(name);
 
-          if (info.compressed) {
-            return false;
-          }
+    for (let i = 0; i < this.options.algorithms.length; i += 1) {
+      const {
+        algorithm,
+        filename,
+        compressionOptions,
+      } = this.options.algorithms[i];
 
-          if (
-            !compiler.webpack.ModuleFilenameHelpers.matchObject.bind(
-              // eslint-disable-next-line no-undefined
-              undefined,
-              this.options
-            )(name)
-          ) {
-            return false;
-          }
+      const assetsForMinify = (
+        await Promise.all(
+          Object.keys(assets).map(async (name) => {
+            const { info, source } = compilation.getAsset(name);
 
-          let relatedName;
-
-          if (typeof this.options.algorithm === "function") {
-            if (typeof this.options.filename === "function") {
-              relatedName = `compression-function-${crypto
-                .createHash("md5")
-                .update(serialize(this.options.filename))
-                .digest("hex")}`;
-            } else {
-              let filenameForRelatedName = this.options.filename;
-
-              const index = filenameForRelatedName.indexOf("?");
-
-              if (index >= 0) {
-                filenameForRelatedName = filenameForRelatedName.substr(
-                  0,
-                  index
-                );
-              }
-
-              relatedName = `${path
-                .extname(filenameForRelatedName)
-                .slice(1)}ed`;
-            }
-          } else if (this.options.algorithm === "gzip") {
-            relatedName = "gzipped";
-          } else {
-            relatedName = `${this.options.algorithm}ed`;
-          }
-
-          if (info.related && info.related[relatedName]) {
-            return false;
-          }
-
-          const cacheItem = cache.getItemCache(
-            serialize({
-              name,
-              algorithm: this.options.algorithm,
-              compressionOptions: this.options.compressionOptions,
-            }),
-            cache.getLazyHashedEtag(source)
-          );
-          const output = (await cacheItem.getPromise()) || {};
-
-          let buffer;
-
-          // No need original buffer for cached files
-          if (!output.source) {
-            if (typeof source.buffer === "function") {
-              buffer = source.buffer();
-            }
-            // Compatibility with webpack plugins which don't use `webpack-sources`
-            // See https://github.com/webpack-contrib/compression-webpack-plugin/issues/236
-            else {
-              buffer = source.source();
-
-              if (!Buffer.isBuffer(buffer)) {
-                // eslint-disable-next-line no-param-reassign
-                buffer = Buffer.from(buffer);
-              }
-            }
-
-            if (buffer.length < this.options.threshold) {
+            if (info.compressed) {
               return false;
-            }
-          }
-
-          return { name, source, info, buffer, output, cacheItem, relatedName };
-        })
-      )
-    ).filter((assetForMinify) => Boolean(assetForMinify));
-
-    const { RawSource } = compiler.webpack.sources;
-    const scheduledTasks = [];
-
-    for (const asset of assetsForMinify) {
-      scheduledTasks.push(
-        (async () => {
-          const {
-            name,
-            source,
-            buffer,
-            output,
-            cacheItem,
-            info,
-            relatedName,
-          } = asset;
-
-          if (!output.source) {
-            if (!output.compressed) {
-              try {
-                output.compressed = await this.runCompressionAlgorithm(buffer);
-              } catch (error) {
-                compilation.errors.push(error);
-
-                return;
-              }
             }
 
             if (
-              output.compressed.length / buffer.length >
-              this.options.minRatio
+              !compiler.webpack.ModuleFilenameHelpers.matchObject.bind(
+                // eslint-disable-next-line no-undefined
+                undefined,
+                this.options
+              )(name)
             ) {
-              await cacheItem.storePromise({ compressed: output.compressed });
-
-              return;
+              return false;
             }
 
-            output.source = new RawSource(output.compressed);
+            let relatedName;
 
-            await cacheItem.storePromise(output);
-          }
+            if (typeof algorithm === "function") {
+              if (typeof filename === "function") {
+                relatedName = `compression-function-${crypto
+                  .createHash("md5")
+                  .update(serialize(filename))
+                  .digest("hex")}`;
+              } else {
+                let filenameForRelatedName = filename;
 
-          const match = /^([^?#]*)(\?[^#]*)?(#.*)?$/.exec(name);
-          const [, replacerFile] = match;
-          const replacerQuery = match[2] || "";
-          const replacerFragment = match[3] || "";
-          const replacerExt = path.extname(replacerFile);
-          const replacerBase = path.basename(replacerFile);
-          const replacerName = replacerBase.slice(
-            0,
-            replacerBase.length - replacerExt.length
-          );
-          const replacerPath = replacerFile.slice(
-            0,
-            replacerFile.length - replacerBase.length
-          );
-          const pathData = {
-            file: replacerFile,
-            query: replacerQuery,
-            fragment: replacerFragment,
-            path: replacerPath,
-            base: replacerBase,
-            name: replacerName,
-            ext: replacerExt || "",
-          };
+                const index = filenameForRelatedName.indexOf("?");
 
-          let newFilename = this.options.filename;
+                if (index >= 0) {
+                  filenameForRelatedName = filenameForRelatedName.substr(
+                    0,
+                    index
+                  );
+                }
 
-          if (typeof newFilename === "function") {
-            newFilename = newFilename(pathData);
-          }
+                relatedName = `${path
+                  .extname(filenameForRelatedName)
+                  .slice(1)}ed`;
+              }
+            } else if (algorithm === "gzip") {
+              relatedName = "gzipped";
+            } else {
+              relatedName = `${algorithm}ed`;
+            }
 
-          const newName = newFilename.replace(
-            /\[(file|query|fragment|path|base|name|ext)]/g,
-            (p0, p1) => pathData[p1]
-          );
+            if (info.related && info.related[relatedName]) {
+              return false;
+            }
 
-          const newInfo = { compressed: true };
+            const cacheItem = cache.getItemCache(
+              serialize({
+                name,
+                algorithm,
+                compressionOptions,
+              }),
+              cache.getLazyHashedEtag(source)
+            );
+            const output = (await cacheItem.getPromise()) || {};
 
-          if (info.immutable && /(\[name]|\[base]|\[file])/.test(newFilename)) {
-            newInfo.immutable = true;
-          }
+            let buffer;
 
-          if (this.options.deleteOriginalAssets) {
-            if (this.options.deleteOriginalAssets === "keep-source-map") {
+            // No need original buffer for cached files
+            if (!output.source) {
+              if (typeof source.buffer === "function") {
+                buffer = source.buffer();
+              }
+              // Compatibility with webpack plugins which don't use `webpack-sources`
+              // See https://github.com/webpack-contrib/compression-webpack-plugin/issues/236
+              else {
+                buffer = source.source();
+
+                if (!Buffer.isBuffer(buffer)) {
+                  // eslint-disable-next-line no-param-reassign
+                  buffer = Buffer.from(buffer);
+                }
+              }
+
+              if (buffer.length < this.options.threshold) {
+                return false;
+              }
+            }
+
+            return {
+              name,
+              source,
+              info,
+              buffer,
+              output,
+              cacheItem,
+              relatedName,
+            };
+          })
+        )
+      ).filter((assetForMinify) => Boolean(assetForMinify));
+
+      const { RawSource } = compiler.webpack.sources;
+      const scheduledTasks = [];
+
+      for (const asset of assetsForMinify) {
+        scheduledTasks.push(
+          (async () => {
+            const {
+              name,
+              source,
+              buffer,
+              output,
+              cacheItem,
+              info,
+              relatedName,
+            } = asset;
+
+            if (!output.source) {
+              if (!output.compressed) {
+                try {
+                  output.compressed = await this.runCompressionAlgorithm(
+                    algorithm,
+                    compressionOptions,
+                    buffer
+                  );
+                } catch (error) {
+                  compilation.errors.push(error);
+
+                  return;
+                }
+              }
+
+              if (
+                output.compressed.length / buffer.length >
+                this.options.minRatio
+              ) {
+                await cacheItem.storePromise({ compressed: output.compressed });
+
+                return;
+              }
+
+              output.source = new RawSource(output.compressed);
+
+              await cacheItem.storePromise(output);
+            }
+
+            const match = /^([^?#]*)(\?[^#]*)?(#.*)?$/.exec(name);
+            const [, replacerFile] = match;
+            const replacerQuery = match[2] || "";
+            const replacerFragment = match[3] || "";
+            const replacerExt = path.extname(replacerFile);
+            const replacerBase = path.basename(replacerFile);
+            const replacerName = replacerBase.slice(
+              0,
+              replacerBase.length - replacerExt.length
+            );
+            const replacerPath = replacerFile.slice(
+              0,
+              replacerFile.length - replacerBase.length
+            );
+            const pathData = {
+              file: replacerFile,
+              query: replacerQuery,
+              fragment: replacerFragment,
+              path: replacerPath,
+              base: replacerBase,
+              name: replacerName,
+              ext: replacerExt || "",
+            };
+
+            let newFilename = filename;
+
+            if (typeof newFilename === "function") {
+              newFilename = newFilename(pathData);
+            }
+
+            const newName = newFilename.replace(
+              /\[(file|query|fragment|path|base|name|ext)]/g,
+              (p0, p1) => pathData[p1]
+            );
+
+            const newInfo = { compressed: true };
+
+            if (
+              info.immutable &&
+              /(\[name]|\[base]|\[file])/.test(newFilename)
+            ) {
+              newInfo.immutable = true;
+            }
+
+            // We only want to delete the asset if we've completed all other
+            // types of compression first
+            if (
+              this.options.deleteOriginalAssets &&
+              i === this.options.algorithms.length - 1
+            ) {
+              if (this.options.deleteOriginalAssets === "keep-source-map") {
+                compilation.updateAsset(name, source, {
+                  related: { sourceMap: null },
+                });
+              }
+
+              compilation.deleteAsset(name);
+            } else {
               compilation.updateAsset(name, source, {
-                related: { sourceMap: null },
+                related: { [relatedName]: newName },
               });
             }
 
-            compilation.deleteAsset(name);
-          } else {
-            compilation.updateAsset(name, source, {
-              related: { [relatedName]: newName },
-            });
-          }
+            compilation.emitAsset(newName, output.source, newInfo);
+          })()
+        );
+      }
 
-          compilation.emitAsset(newName, output.source, newInfo);
-        })()
-      );
+      await Promise.all(scheduledTasks);
     }
-
-    return Promise.all(scheduledTasks);
   }
 
   apply(compiler) {
