@@ -70,6 +70,15 @@
         }
       ]
     },
+    "algorithms": {
+      "description": "The compression algorithms/functions.",
+      "type": "array",
+      "items": {
+        "description": "The compression algorithm/function.",
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
     "compressionOptions": {
       "description": "Compression options for `algorithm`.",
       "additionalProperties": true,

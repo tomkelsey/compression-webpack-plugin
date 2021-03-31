@@ -322,21 +322,20 @@ class CompressionPlugin {
 
             // We only want to delete the asset if we've completed all other
             // types of compression first
-            if (
-              this.options.deleteOriginalAssets &&
-              i === this.options.algorithms.length - 1
-            ) {
-              if (this.options.deleteOriginalAssets === "keep-source-map") {
+            if (i === this.options.algorithms.length - 1) {
+              if (this.options.deleteOriginalAssets) {
+                if (this.options.deleteOriginalAssets === "keep-source-map") {
+                  compilation.updateAsset(name, source, {
+                    related: { sourceMap: null },
+                  });
+                }
+
+                compilation.deleteAsset(name);
+              } else {
                 compilation.updateAsset(name, source, {
-                  related: { sourceMap: null },
+                  related: { [relatedName]: newName },
                 });
               }
-
-              compilation.deleteAsset(name);
-            } else {
-              compilation.updateAsset(name, source, {
-                related: { [relatedName]: newName },
-              });
             }
 
             compilation.emitAsset(newName, output.source, newInfo);
